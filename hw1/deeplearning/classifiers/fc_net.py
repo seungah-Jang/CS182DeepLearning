@@ -216,22 +216,22 @@ class FullyConnectedNet(object):
         # parameters should be initialized to zero.                                #
         ############################################################################
         
-        layer_dims = [input_dim] + hidden_dims + [num_classes]
+        # 각 layer 마다 가중치, 편향 초기화
+        layer_input_dim = input_dim # 첫 번째 레이어는 입력 데이터의 크기 / 그 다음 레이어들은 이전 레이어의 출력 크기를 입력으로 받는다.
+
+        
         for i in range(self.num_layers):
-          W_key = f'W{i+1}'
-          b_key = f'b{i+1}'
-        
-          self.params[W_key] = weight_scale * np.random.randn(layer_dims[i], layer_dims[i+1])
-          self.params[b_key] = np.zeros(layer_dims[i+1])
-        
-        if self.use_batchnorm and i < self.num_layers - 1:
-          gamma_key = f'gamma{i+1}'
-          beta_key = f'beta{i+1}'
-            
-          self.params[gamma_key] = np.ones(layer_dims[i+1])
-          self.params[beta_key] = np.zeros(layer_dims[i+1])
+            layer_output_dim = hidden_dims[i] if i < self.num_layers -1 else num_classes # 은닉층이면 hidden_dim, 마지막층이면 num_classes
+            # 표준 정규분포를 따르는 랜덤숫자를 (layer_input_dim,layer_output_dim) 크기의 행렬로 생성
+            # weight scale 을 곱하여, 크기를 조절함.
+            self.params[f'W{i+1}'] = weight_scale * np.random.randn(layer_input_dim, layer_output_dim)
+            # bias 를 0으로 초기화
+            self.params[f'b{i+1}'] = np.zeros(layer_output_dim)
 
-
+            if self.use_batchnorm and i < self.num_layers-1:
+                self.params[f'gamma{i+1}'] = np.ones(layer_output_dim)
+                self.params[f'beta{i+1}'] = np.zeros(layer_output_dim)
+            layer_input_dim = layer_output_dim
 
 
         ############################################################################
@@ -290,22 +290,32 @@ class FullyConnectedNet(object):
         # self.bn_params[1] to the forward pass for the second batch normalization #
         # layer, etc.                                                              #
         ############################################################################
-        caches = {}
+
+        caches = []
         out = X
-
         for i in range(1, self.num_layers):
-            W = self.params[f'W{i}']
-            b = self.params[f'b{i}']
-
+            W, b = self.params[f'W{i}'], self.params[f'b{i}']
             out, fc_cache = affine_forward(out, W, b)
+
+            if self.use_batchnorm:
+                gamma, beta = self.params[f'gamma{i}'], self.params[f'beta{i}']
+                bn_param = self.bn_params[i-1]
+                out, bn_cache = batchnorm_forward(out, gamma, beta, bn_param)
+            else:
+                bn_cache = None
+
             out, relu_cache = relu_forward(out)
 
-            caches[i] = (fc_cache, relu_cache)
+            if self.use_dropout:
+                out, do_cache = dropout_forward(out, self.dropout_param)
+            else:
+                do_cache = None
 
-        W = self.params[f'W{self.num_layers}']
-        b = self.params[f'b{self.num_layers}']
+            caches.append((fc_cache, bn_cache, relu_cache, do_cache))
 
-        scores, final_cache = affine_forward(out, W, b)
+        W_final, b_final = self.params[f'W{self.num_layers}'], self.params[f'b{self.num_layers}']
+        scores, final_cache = affine_forward(out, W_final, b_final)        
+
 
         ############################################################################
         #                             END OF YOUR CODE                             #
@@ -330,36 +340,64 @@ class FullyConnectedNet(object):
         # automated tests, make sure that your L2 regularization includes a factor #
         # of 0.5 to simplify the expression for the gradient.                      #
         ############################################################################
-        loss, dscores = softmax_loss(scores, y)
+        
+        # softmax loss 계산, scores: forward에서 계산된 출력값(로짓)
+        loss, dout = softmax_loss(scores, y)
 
-        reg_loss = 0.0
-        
-        
-        
+        # 각 가중치 W 에 대해 L2 정규화 손실 추가
         for i in range(1, self.num_layers + 1):
             W = self.params[f'W{i}']
-            reg_loss += 0.5 * self.reg * np.sum(W * W)
+            loss += 0.5 * self.reg * np.sum(W * W)
 
-        loss += reg_loss
-
-        grads = {}
-
-        dout, dW, db = affine_backward(dscores, final_cache)
-        grads[f'W{self.num_layers}'] = dW + self.reg * self.params[f'W{self.num_layers}']
+        # dout : 다음 층에 넘길 gradient
+        # dw, db : 해당 층의 weight, bias 에 대한 gradient
+        # dw 에 정규화 추가 
+        dout, dw, db = affine_backward(dout, final_cache)
+        grads[f'W{self.num_layers}'] = dw + self.reg * self.params[f'W{self.num_layers}']
         grads[f'b{self.num_layers}'] = db
 
+        # 각 은닉층에 대한 역전파
         for i in reversed(range(1, self.num_layers)):
-            fc_cache, relu_cache = caches[i]
+            fc_cache, bn_cache, relu_cache, do_cache = caches[i-1]
 
+            # dropout : 꺼졌던 뉴런 복원하는 gradient
+            if self.use_dropout:
+                dout = dropout_backward(dout, do_cache)
+
+            # 0 이하였던 뉴런은 gradient 가 0 이 됨.
             dout = relu_backward(dout, relu_cache)
-            dout, dW, db = affine_backward(dout, fc_cache)
 
-            grads[f'W{i}'] = dW + self.reg * self.params[f'W{i}']
+            # batch normalization 인 경우, scale(gamma)와 shift(beta) 에 대한 gradient 계산
+            if self.use_batchnorm:
+                dout, dgamma, dbeta = batchnorm_backward(dout, bn_cache)
+                grads[f'gamma{i}'] = dgamma
+                grads[f'beta{i}'] = dbeta
+
+            # 마지막은 affine 역전파
+            dout, dw, db = affine_backward(dout, fc_cache)
+            grads[f'W{i}'] = dw + self.reg * self.params[f'W{i}']
             grads[f'b{i}'] = db
+            '''
+            [Output Layer]
+            softmax_loss
+            → affine_backward
+            → grads[W3], grads[b3]
 
+            [Hidden Layer 2]
+            → dropout_backward (선택)
+            → relu_backward
+            → batchnorm_backward (선택)
+            → affine_backward
+            → grads[W2], b2, gamma2, beta2
 
+            [Hidden Layer 1]
+            → dropout_backward (선택)
+            → relu_backward
+            → batchnorm_backward (선택)
+            → affine_backward
+            → grads[W1], b1, gamma1, beta1
+            '''
         ############################################################################
         #                             END OF YOUR CODE                             #
         ############################################################################
-
         return loss, grads
